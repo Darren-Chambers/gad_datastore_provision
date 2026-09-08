@@ -1,0 +1,472 @@
+---
+# provision_gad_datastore.yml
+#
+# End to end: LDEV on the primary -> presented to the cluster's host groups
+# -> GAD pair (S-VOL created and presented on the secondary) -> cluster
+# rescan -> VMFS datastore. Survey-driven; survey built by update_aap_survey.yml.
+#
+# Survey variables:
+#   gad_pair        "840130 -> 840183"   (primary serial parsed from it)
+#   esx_cluster     "CLUSTER [840130 -> 840183]"   (cluster name parsed)
+#   primary_pool    "840130 | pool 0 | NAME | 12.3 TiB free"
+#   secondary_pool  "840183 | pool 0 | NAME | 12.3 TiB free"
+#   datastore_name  text
+#   size_gb         integer
+#   confirm         blank = plan only; CONFIRM = provision
+#
+# SAFETY MODEL
+#   Nothing is trusted from the survey labels. Every run re-discovers the
+#   cluster's hosts, their WWPNs, and the matching host groups on both
+#   arrays, and re-validates pools, quorum and name collisions. The run
+#   halts after printing the full plan unless confirm == CONFIRM. Once
+#   past the gate there is no cheap undo, so the gate is BEFORE the first
+#   write, not after. After provisioning, the datastore is only created on
+#   a device that (a) the array reports as the new P-VOL's canonical NAA,
+#   (b) every host in the cluster can see post-rescan, and (c) is not
+#   already backing a datastore.
+#
+- name: Provision a GAD-protected VMFS datastore
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    confirm_token: "CONFIRM"
+
+  tasks:
+    # ==================================================================
+    # 0. Inputs
+    # ==================================================================
+    - name: Load site config and vault
+      ansible.builtin.include_tasks: tasks/load_site.yml
+
+    - name: Parse survey answers
+      ansible.builtin.set_fact:
+        pair_primary_serial: "{{ gad_pair | regex_search('^\\s*(\\d+)', '\\1') | first }}"
+        cluster_name: "{{ esx_cluster | regex_replace('\\s*\\[.*\\]\\s*$', '') | trim }}"
+        primary_pool_serial: "{{ primary_pool.split('|')[0] | trim }}"
+        primary_pool_id: "{{ primary_pool.split('|')[1] | regex_search('\\d+') }}"
+        secondary_pool_serial: "{{ secondary_pool.split('|')[0] | trim }}"
+        secondary_pool_id: "{{ secondary_pool.split('|')[1] | regex_search('\\d+') }}"
+        size_gb_int: "{{ size_gb | int }}"
+        ds_name: "{{ datastore_name | trim }}"
+        do_provision: "{{ (confirm | default('') | trim) == confirm_token }}"
+
+    - name: Validate datastore name
+      ansible.builtin.fail:
+        msg: "datastore_name '{{ ds_name }}' must be 1-32 chars of [A-Za-z0-9_-] (used as LDEV label and copy pair name)."
+      when: ds_name is not match('^[A-Za-z0-9_-]{1,32}$')
+
+    - name: Validate size
+      ansible.builtin.fail:
+        msg: "size_gb must be an integer >= 10 (got '{{ size_gb }}')."
+      when: size_gb_int | int < 10
+
+    - name: Load pair
+      ansible.builtin.include_tasks: tasks/load_pair.yml
+
+    - name: Fail if pools are not on the right arrays
+      ansible.builtin.fail:
+        msg: >-
+          Pool selection does not match pair {{ pair.label }}:
+          primary pool is on {{ primary_pool_serial }} (need {{ pair.primary.serial }}),
+          secondary pool is on {{ secondary_pool_serial }} (need {{ pair.secondary.serial }}).
+      when: primary_pool_serial != pair.primary.serial or secondary_pool_serial != pair.secondary.serial
+
+    # ==================================================================
+    # 1. Discover cluster and host groups (both arrays)
+    # ==================================================================
+    - name: Discover cluster hosts and WWPNs
+      ansible.builtin.include_tasks: tasks/discover_cluster.yml
+
+    - name: Fetch host groups from both arrays
+      ansible.builtin.include_tasks: tasks/fetch_array_hostgroups.yml
+      loop:
+        - { array: "{{ pair.primary }}", role: primary }
+        - { array: "{{ pair.secondary }}", role: secondary }
+      loop_control:
+        loop_var: side
+        label: "{{ side.role }}"
+      vars:
+        array: "{{ side.array }}"
+        role: "{{ side.role }}"
+
+    - name: Match host groups on primary
+      ansible.builtin.include_tasks: tasks/match_hostgroups.yml
+      vars:
+        array: "{{ pair.primary }}"
+        role: primary
+
+    - name: Keep primary match
+      ansible.builtin.set_fact:
+        p_hgs: "{{ matched_hgs }}"
+        p_missing: "{{ hg_missing_hosts }}"
+
+    - name: Match host groups on secondary
+      ansible.builtin.include_tasks: tasks/match_hostgroups.yml
+      vars:
+        array: "{{ pair.secondary }}"
+        role: secondary
+
+    - name: Keep secondary match
+      ansible.builtin.set_fact:
+        s_hgs: "{{ matched_hgs }}"
+        s_missing: "{{ hg_missing_hosts }}"
+
+    - name: Fail if any cluster host has no host group on either array
+      ansible.builtin.fail:
+        msg: >-
+          Cluster {{ cluster_name }} is not fully presented on pair {{ pair.label }}.
+          Hosts with no FC host group on primary {{ pair.primary.serial }}: {{ p_missing }}.
+          Hosts with no FC host group on secondary {{ pair.secondary.serial }}: {{ s_missing }}.
+          Refusing to create a datastore some hosts could not see.
+      when: p_missing | length > 0 or s_missing | length > 0
+
+    - name: Fail if secondary host groups are in the meta resource group
+      ansible.builtin.fail:
+        msg: >-
+          hv_gad requires secondary host groups to be in a VSM resource group, not RG 0.
+          These are in RG 0 on {{ pair.secondary.serial }}:
+          {{ s_hgs | selectattr('resource_group_id', 'equalto', 0) | map(attribute='name') | list }}.
+      when: s_hgs | selectattr('resource_group_id', 'equalto', 0) | list | length > 0
+
+    # ==================================================================
+    # 2. Pools, quorum, LUN, name collisions
+    # ==================================================================
+    - name: Get pools on both arrays
+      hitachivantara.vspone_block.vsp.hv_storagepool_facts:
+        connection_info: "{{ item.connection_info }}"
+      loop:
+        - "{{ pair.primary }}"
+        - "{{ pair.secondary }}"
+      loop_control:
+        label: "{{ item.serial }}"
+      register: pool_facts
+      no_log: true
+
+    - name: Resolve selected pools
+      ansible.builtin.set_fact:
+        p_pool: "{{ pool_facts.results[0].ansible_facts.storage_pool | selectattr('pool_id', 'equalto', primary_pool_id | int) | first | default({}) }}"
+        s_pool: "{{ pool_facts.results[1].ansible_facts.storage_pool | selectattr('pool_id', 'equalto', secondary_pool_id | int) | first | default({}) }}"
+
+    - name: Fail if a selected pool no longer exists
+      ansible.builtin.fail:
+        msg: "Selected pool not found (survey may be stale): primary={{ p_pool | length > 0 }} secondary={{ s_pool | length > 0 }}. Re-run the survey refresh."
+      when: p_pool | length == 0 or s_pool | length == 0
+
+    - name: Fail if either pool lacks free capacity for this volume
+      ansible.builtin.fail:
+        msg: >-
+          Insufficient free capacity for {{ size_gb_int }} GB:
+          primary pool {{ p_pool.pool_name }} has {{ (p_pool.available_volume_capacity_mb | int / 1024) | int }} GB,
+          secondary pool {{ s_pool.pool_name }} has {{ (s_pool.available_volume_capacity_mb | int / 1024) | int }} GB.
+      when: >-
+        (p_pool.available_volume_capacity_mb | int / 1024) < (size_gb_int | int)
+        or (s_pool.available_volume_capacity_mb | int / 1024) < (size_gb_int | int)
+
+    - name: Get quorum disks on primary
+      hitachivantara.vspone_block.vsp.hv_quorum_disk_facts:
+        connection_info: "{{ pair.primary.connection_info }}"
+      register: quorum_facts
+      no_log: true
+
+    - name: Resolve quorum disk (override, or the one NORMAL quorum pointing at the secondary)
+      ansible.builtin.set_fact:
+        quorum_candidates: >-
+          {{ quorum_facts.ansible_facts.quorum_disk | default([])
+             | selectattr('remote_serial_number', 'defined')
+             | selectattr('remote_serial_number', 'equalto', pair.secondary.serial)
+             | selectattr('status', 'equalto', 'NORMAL') | list }}
+
+    - name: Set quorum disk id
+      ansible.builtin.set_fact:
+        resolved_quorum_id: "{{ quorum_disk_id | default(quorum_candidates[0].quorum_disk_id if quorum_candidates | length == 1 else '') }}"
+
+    - name: Fail if quorum could not be resolved
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve a quorum disk on {{ pair.primary.serial }} for remote {{ pair.secondary.serial }}:
+          {{ quorum_candidates | length }} NORMAL candidates
+          {{ quorum_candidates | map(attribute='quorum_disk_id') | list }}.
+          Set quorum_disk_id in vars/site_config.yml to choose one.
+      when: resolved_quorum_id | string == ''
+
+    - name: Compute lowest LUN free on every matched host group on both arrays
+      ansible.builtin.set_fact:
+        used_luns: "{{ (p_hgs + s_hgs) | map(attribute='used_luns') | flatten | map('int') | unique | list }}"
+
+    - name: Set LUN id
+      ansible.builtin.set_fact:
+        resolved_lun_id: "{{ lun_id | default(range(0, 1024) | difference(used_luns) | first) | int }}"
+
+    - name: Fail if forced LUN id is in use somewhere
+      ansible.builtin.fail:
+        msg: "lun_id {{ resolved_lun_id }} is already used on one of the matched host groups."
+      when: resolved_lun_id | int in used_luns
+
+    - name: Check datastore name is not already in vCenter
+      community.vmware.vmware_datastore_info:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        name: "{{ ds_name }}"
+      register: ds_check
+
+    - name: Fail if datastore already exists
+      ansible.builtin.fail:
+        msg: "Datastore '{{ ds_name }}' already exists in {{ vcenter_datacenter }}."
+      when: ds_check.datastores | length > 0
+
+    - name: Check an LDEV with this name doesn't already exist on the primary
+      hitachivantara.vspone_block.vsp.hv_ldev_facts:
+        connection_info: "{{ pair.primary.connection_info }}"
+        spec:
+          name: "{{ ds_name }}"
+      register: ldev_name_check
+      no_log: true
+      failed_when: false
+
+    - name: Fail if an LDEV named {{ ds_name }} already exists on the primary
+      ansible.builtin.fail:
+        msg: >-
+          LDEV(s) named '{{ ds_name }}' already exist on {{ pair.primary.serial }}:
+          {{ ldev_name_check.ansible_facts.volumes | default([]) | map(attribute='ldev_id') | list }}.
+      when: ldev_name_check.ansible_facts.volumes | default([]) | length > 0
+
+    - name: Derive GAD naming
+      ansible.builtin.set_fact:
+        copy_group_name: "{{ ('AAP_' ~ cluster_name) | regex_replace('[^A-Za-z0-9_-]', '_') | truncate(31, true, '') }}"
+        copy_pair_name: "{{ ds_name }}"
+
+    # ==================================================================
+    # 3. Plan + gate
+    # ==================================================================
+    - name: "PLAN | Review before proceeding"
+      ansible.builtin.debug:
+        msg:
+          - "================ PROVISIONING PLAN ================"
+          - "Pair               : {{ pair.label }}"
+          - "Cluster            : {{ cluster_name }} ({{ cluster_hosts | length }} hosts: {{ cluster_hosts | join(', ') }})"
+          - "Datastore / LDEV   : {{ ds_name }}  {{ size_gb_int }} GB  VMFS{{ vmfs_version | default(6) }}"
+          - "Capacity saving    : {{ ldev_capacity_saving | default('disabled') }}"
+          - "Primary pool       : {{ pair.primary.serial }} pool {{ p_pool.pool_id }} {{ p_pool.pool_name }}"
+          - "Secondary pool     : {{ pair.secondary.serial }} pool {{ s_pool.pool_id }} {{ s_pool.pool_name }}"
+          - "Quorum disk        : {{ resolved_quorum_id }}"
+          - "LUN (both arrays)  : {{ resolved_lun_id }}"
+          - "Copy group / pair  : {{ copy_group_name }} / {{ copy_pair_name }}"
+          - "Primary host groups:"
+          - "{{ p_hgs | map(attribute='port_id') | zip(p_hgs | map(attribute='name'), p_hgs | map(attribute='hosts')) | map('join', '  ') | list }}"
+          - "Secondary host groups:"
+          - "{{ s_hgs | map(attribute='port_id') | zip(s_hgs | map(attribute='name'), s_hgs | map(attribute='hosts')) | map('join', '  ') | list }}"
+          - "==================================================="
+          - "{{ 'confirm=CONFIRM - proceeding.' if do_provision else 'Plan only. Re-launch with Confirm = CONFIRM to provision.' }}"
+
+    - name: Halt unless confirmed
+      ansible.builtin.meta: end_play
+      when: not do_provision
+
+    # ==================================================================
+    # 4. Primary: create LDEV, present to host groups
+    # ==================================================================
+    - name: Storage side (P-VOL -> host groups -> GAD). Rolls back the P-VOL if the pair was not created.
+      block:
+        - name: Create P-VOL on primary
+          hitachivantara.vspone_block.vsp.hv_ldev:
+            connection_info: "{{ pair.primary.connection_info }}"
+            state: present
+            spec:
+              pool_id: "{{ p_pool.pool_id | int }}"
+              size: "{{ size_gb_int }}GB"
+              name: "{{ ds_name }}"
+              capacity_saving: "{{ ldev_capacity_saving | default('disabled') }}"
+          register: pvol
+
+        - name: Set P-VOL facts
+          ansible.builtin.set_fact:
+            pvol_id: "{{ pvol.volume.ldev_id }}"
+            pvol_naa: "{{ pvol.volume.canonical_name | default('') }}"
+
+        - name: Present P-VOL to each primary host group at LUN {{ resolved_lun_id }}
+          hitachivantara.vspone_block.vsp.hv_hg:
+            connection_info: "{{ pair.primary.connection_info }}"
+            state: present
+            spec:
+              state: present_ldev
+              port_id: "{{ item.port_id }}"
+              name: "{{ item.name }}"
+              lun_paths:
+                - ldev: "{{ pvol_id }}"
+                  lun: "{{ resolved_lun_id }}"
+          loop: "{{ p_hgs }}"
+          loop_control:
+            label: "{{ item.port_id }} {{ item.name }}"
+
+        # ==================================================================
+        # 5. GAD pair (creates + presents the S-VOL on the secondary)
+        # ==================================================================
+        - name: Build secondary host group spec for hv_gad
+          ansible.builtin.set_fact:
+            s_hg_spec: >-
+              {%- set out = [] -%}
+              {%- for hg in s_hgs -%}
+                {%- set _ = out.append({'name': hg.name, 'port_id': hg.port_id,
+                                        'lun_id': resolved_lun_id | int, 'enable_preferred_path': false}) -%}
+              {%- endfor -%}
+              {{ out }}
+
+        - name: Create GAD pair
+          hitachivantara.vspone_block.vsp.hv_gad:
+            connection_info: "{{ pair.primary.connection_info }}"
+            secondary_connection_info: "{{ pair.secondary.connection_info }}"
+            state: present
+            spec:
+              copy_group_name: "{{ copy_group_name }}"
+              copy_pair_name: "{{ copy_pair_name }}"
+              primary_volume_id: "{{ pvol_id }}"
+              secondary_pool_id: "{{ s_pool.pool_id | int }}"
+              quorum_disk_id: "{{ resolved_quorum_id | int }}"
+              copy_pace: "{{ gad_copy_pace | default(3) }}"
+              secondary_hostgroups: "{{ s_hg_spec }}"
+          register: gad
+
+      rescue:
+        - name: "ROLLBACK | Delete P-VOL {{ pvol_id | default('n/a') }} (only if no GAD pair was created)"
+          hitachivantara.vspone_block.vsp.hv_ldev:
+            connection_info: "{{ pair.primary.connection_info }}"
+            state: absent
+            spec:
+              ldev_id: "{{ pvol_id }}"
+              force: true
+          when: pvol_id is defined and (gad is not defined or gad.failed | default(true))
+          register: rollback
+          failed_when: false
+
+        - name: "ROLLBACK | Report"
+          ansible.builtin.fail:
+            msg: >-
+              Storage provisioning failed: {{ ansible_failed_result.msg | default(ansible_failed_result) }}.
+              {{ ('P-VOL ' ~ pvol_id ~ (' deleted.' if (rollback.volume | default('')) == 'Volume deleted' else ' NOT deleted - clean up manually: ' ~ (rollback.msg | default('')))) if pvol_id is defined else 'No LDEV was created.' }}
+              {{ 'GAD pair may exist - inspect ' ~ copy_group_name ~ '/' ~ copy_pair_name ~ ' on both arrays before retrying.' if gad is defined else '' }}
+
+    - name: Set GAD facts
+      ansible.builtin.set_fact:
+        svol_id: "{{ gad.data.secondary_volume_id }}"
+        pair_status: "{{ gad.data.primary_volume_status }}"
+
+    - name: Read back P-VOL canonical NAA from the array
+      hitachivantara.vspone_block.vsp.hv_ldev_facts:
+        connection_info: "{{ pair.primary.connection_info }}"
+        spec:
+          ldev_id: "{{ pvol_id }}"
+      register: pvol_facts
+      no_log: true
+
+    - name: Set expected NAA
+      ansible.builtin.set_fact:
+        expected_naa: "{{ pvol_facts.ansible_facts.volumes[0].canonical_name | lower }}"
+
+    - name: Fail if the array did not report a canonical NAA
+      ansible.builtin.fail:
+        msg: "hv_ldev_facts returned no canonical_name for LDEV {{ pvol_id }}. Refusing to guess the device."
+      when: expected_naa is not match('^naa\.')
+
+    # ==================================================================
+    # 6. Rescan and verify on every host
+    # ==================================================================
+    - name: Rescan HBAs and VMFS on every host in the cluster
+      community.vmware.vmware_host_scanhba:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        esxi_hostname: "{{ item }}"
+        rescan_hba: true
+        rescan_vmfs: true
+      loop: "{{ cluster_hosts }}"
+
+    - name: Gather live SCSI devices and mounted volumes from every host
+      community.vmware.vmware_host_facts:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        esxi_hostname: "{{ item }}"
+        schema: vsphere
+        properties:
+          - "config.storageDevice.scsiLun"
+          - "config.fileSystemVolume.mountInfo"
+      loop: "{{ cluster_hosts }}"
+      register: host_device_facts
+
+    - name: Hosts that do NOT see the new device
+      ansible.builtin.set_fact:
+        hosts_missing_device: >-
+          {%- set out = [] -%}
+          {%- for r in host_device_facts.results -%}
+            {%- set luns = r.ansible_facts.config.storageDevice.scsiLun | default([]) -%}
+            {%- set names = luns | map(attribute='canonicalName', default='') | map('lower') | list -%}
+            {%- if expected_naa not in names -%}{%- set _ = out.append(r.item) -%}{%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Fail if any host cannot see the device
+      ansible.builtin.fail:
+        msg: >-
+          {{ expected_naa }} not visible on {{ hosts_missing_device }} after rescan.
+          Storage side is complete (P-VOL {{ pvol_id }}, S-VOL {{ svol_id }}, pair {{ pair_status }}).
+          Check zoning/paths, then re-run this job with the same answers: it will
+          fail on the name-collision checks - create the datastore manually on
+          {{ expected_naa }} or clean up the pair first.
+      when: hosts_missing_device | length > 0
+
+    - name: Build list of NAAs already claimed by datastores
+      ansible.builtin.set_fact:
+        claimed_naas: >-
+          {{ host_device_facts.results | map(attribute='ansible_facts')
+             | map(attribute='config.fileSystemVolume.mountInfo', default=[]) | flatten
+             | selectattr('volume.extent', 'defined') | map(attribute='volume.extent') | flatten
+             | map(attribute='diskName') | map('lower') | unique | list }}
+
+    - name: Fail if the device is already backing a datastore
+      ansible.builtin.fail:
+        msg: "{{ expected_naa }} is already an extent of an existing datastore."
+      when: expected_naa in claimed_naas
+
+    # ==================================================================
+    # 7. Datastore
+    # ==================================================================
+    - name: Create VMFS datastore on {{ expected_naa }}
+      community.vmware.vmware_host_datastore:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        esxi_hostname: "{{ cluster_hosts[0] }}"
+        datastore_name: "{{ ds_name }}"
+        datastore_type: vmfs
+        vmfs_device_name: "{{ expected_naa }}"
+        vmfs_version: "{{ vmfs_version | default(6) }}"
+        state: present
+
+    - name: Rescan VMFS on the remaining hosts so the datastore mounts everywhere
+      community.vmware.vmware_host_scanhba:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        esxi_hostname: "{{ item }}"
+        rescan_hba: false
+        rescan_vmfs: true
+      loop: "{{ cluster_hosts[1:] }}"
+
+    - name: "SUMMARY"
+      ansible.builtin.debug:
+        msg:
+          - "================ PROVISIONED ================"
+          - "Datastore   : {{ ds_name }} ({{ size_gb_int }} GB) on {{ cluster_name }}"
+          - "Device      : {{ expected_naa }}"
+          - "P-VOL       : {{ pair.primary.serial }} LDEV {{ pvol_id }} pool {{ p_pool.pool_id }}"
+          - "S-VOL       : {{ pair.secondary.serial }} LDEV {{ svol_id }} pool {{ s_pool.pool_id }}"
+          - "GAD         : {{ copy_group_name }}/{{ copy_pair_name }} quorum {{ resolved_quorum_id }} status {{ pair_status }}"
+          - "LUN         : {{ resolved_lun_id }} on {{ p_hgs | length }} primary + {{ s_hgs | length }} secondary host groups"

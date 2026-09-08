@@ -1,0 +1,29 @@
+---
+# tasks/load_site.yml
+# Loads vars/site_config.yml (gitignored) and the AAP/vCenter vault file.
+
+- name: Check site config exists
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/vars/site_config.yml"
+  register: site_config_stat
+
+- name: Fail if site config is missing
+  ansible.builtin.fail:
+    msg: "vars/site_config.yml not found. Copy vars/site_config.yml.example and populate it."
+  when: not site_config_stat.stat.exists
+
+- name: Load site config
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/vars/site_config.yml"
+
+- name: Load AAP / vCenter vault
+  ansible.builtin.include_vars:
+    file: "{{ playbook_dir }}/ansible_vault_vars/ansible_vault.yml"
+
+- name: Set vCenter connection dict
+  ansible.builtin.set_fact:
+    vc:
+      hostname: "{{ vcenter_hostname }}"
+      username: "{{ vault_vcenter_username }}"
+      password: "{{ vault_vcenter_password }}"
+      validate_certs: "{{ vcenter_validate_certs | default(false) }}"

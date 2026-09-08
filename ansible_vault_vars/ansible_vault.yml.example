@@ -1,0 +1,8 @@
+---
+# Copy to ansible_vault_vars/ansible_vault.yml, populate, then:
+#   ansible-vault encrypt ansible_vault_vars/ansible_vault.yml
+# AAP + vCenter only. Array credentials live in per-pair files (see below).
+vault_aap_user: "aap_admin"
+vault_aap_pass: "changeme"
+vault_vcenter_username: "administrator@vsphere.local"
+vault_vcenter_password: "changeme"

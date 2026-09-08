@@ -1,0 +1,21 @@
+---
+# vars/site_config.yml.example
+# Copy to vars/site_config.yml and populate. Gitignored - never commit.
+
+# AAP controller (update_aap_survey.yml) - include scheme
+aap_host: "https://aap.example.local"
+aap_validate_certs: false
+
+# vCenter (both playbooks)
+vcenter_hostname: "vcenter.example.local"
+vcenter_datacenter: "Datacenter1"
+vcenter_validate_certs: false
+
+# Provisioning defaults
+ldev_capacity_saving: "disabled"          # disabled | compression | compression_deduplication
+vmfs_version: 6
+gad_copy_pace: 3                          # 1-15
+
+# Optional overrides. Leave unset for auto-discovery.
+# quorum_disk_id: 0                       # force a quorum disk instead of discovering one
+# lun_id: 10                              # force a LUN number instead of lowest common free

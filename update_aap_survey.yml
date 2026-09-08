@@ -1,0 +1,229 @@
+---
+# update_aap_survey.yml
+#
+# Rebuilds the "Provision GAD Datastore" survey from live data. Run
+# nightly. Everything the operator can choose from is discovered:
+#
+#   GAD Pair      - from the vault filenames ansible_vault_storage_<serial>.yml
+#   ESX Cluster   - vCenter clusters, kept only if every host in the cluster
+#                   has an FC host group (matched by WWN) on BOTH arrays of
+#                   at least one pair. Label shows which pair(s).
+#   Pools         - DP pools on every array, label shows free capacity
+#
+# The labels are for the operator. provision_gad_datastore.yml re-discovers
+# everything at run time and never trusts a label.
+#
+# Extra var required on the job template running this:
+#   aap_job_template_id: <ID of the Provision GAD Datastore job template>
+#
+- name: Refresh AAP survey from live vCenter and array data
+  hosts: localhost
+  gather_facts: false
+
+  tasks:
+    - name: Fail if aap_job_template_id was not supplied
+      ansible.builtin.fail:
+        msg: "aap_job_template_id must be set as an Extra Variable on this job template."
+      when: aap_job_template_id is not defined
+
+    - name: Load site config and vault
+      ansible.builtin.include_tasks: tasks/load_site.yml
+
+    # ------------------------------------------------------------------
+    # Pairs: one per vault file
+    # ------------------------------------------------------------------
+    - name: Find pair vault files
+      ansible.builtin.find:
+        paths: "{{ playbook_dir }}/ansible_vault_vars"
+        patterns: "ansible_vault_storage_*.yml"
+      register: pair_files
+
+    - name: Parse primary serials from filenames
+      ansible.builtin.set_fact:
+        pair_serials: >-
+          {{ pair_files.files | map(attribute='path') | map('basename')
+             | map('regex_replace', '^ansible_vault_storage_(.+)\.yml$', '\1')
+             | sort }}
+
+    - name: Fail if no pair vault files were found
+      ansible.builtin.fail:
+        msg: "No ansible_vault_vars/ansible_vault_storage_<serial>.yml files found."
+      when: pair_serials | length == 0
+
+    # ------------------------------------------------------------------
+    # Clusters: hosts + WWPNs, once per cluster
+    # ------------------------------------------------------------------
+    - name: Get all clusters in the datacenter
+      community.vmware.vmware_cluster_info:
+        hostname: "{{ vc.hostname }}"
+        username: "{{ vc.username }}"
+        password: "{{ vc.password }}"
+        validate_certs: "{{ vc.validate_certs }}"
+        datacenter: "{{ vcenter_datacenter }}"
+        schema: summary
+      register: all_clusters_info
+
+    - name: Set cluster list
+      ansible.builtin.set_fact:
+        all_cluster_names: "{{ all_clusters_info.clusters.keys() | list | sort }}"
+
+    - name: Discover hosts and WWPNs for each cluster
+      ansible.builtin.include_tasks: tasks/survey_cluster.yml
+      loop: "{{ all_cluster_names }}"
+      loop_control:
+        loop_var: cluster_name
+
+    # ------------------------------------------------------------------
+    # Per pair: pools + which clusters are GAD-capable on it
+    # ------------------------------------------------------------------
+    - name: Discover each pair
+      ansible.builtin.include_tasks: tasks/survey_pair.yml
+      loop: "{{ pair_serials }}"
+      loop_control:
+        loop_var: pair_primary_serial
+
+    - name: Build cluster choices (capable clusters only, labelled with their pairs)
+      ansible.builtin.set_fact:
+        cluster_choices: >-
+          {%- set out = [] -%}
+          {%- for c in all_cluster_names -%}
+            {%- set pairs = capable_pairs_by_cluster[c] | default([]) -%}
+            {%- if pairs | length > 0 -%}
+              {%- set _ = out.append(c ~ ' [' ~ (pairs | join(', ')) ~ ']') -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ out }}
+
+    - name: Fail if no cluster is GAD-capable on any pair
+      ansible.builtin.fail:
+        msg: >-
+          No cluster has FC host groups on both arrays of any pair.
+          Per-cluster detail: {{ cluster_capability_notes | default({}) }}
+      when: cluster_choices | length == 0
+
+    - name: "DEBUG | Discovery summary"
+      ansible.builtin.debug:
+        msg:
+          - "Pairs            : {{ pair_labels }}"
+          - "Capable clusters : {{ cluster_choices }}"
+          - "Not capable      : {{ cluster_capability_notes | default({}) }}"
+          - "Pool choices     : {{ pool_choices }}"
+
+    # ------------------------------------------------------------------
+    # Preserve existing defaults where they still exist
+    # ------------------------------------------------------------------
+    - name: Set AAP API base URL
+      ansible.builtin.set_fact:
+        aap_api_base: "{{ aap_host }}/api/controller/v2"
+
+    - name: Get existing survey spec
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/job_templates/{{ aap_job_template_id }}/survey_spec/"
+        method: GET
+        user: "{{ vault_aap_user }}"
+        password: "{{ vault_aap_pass }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs | default(false) }}"
+        status_code: [200, 404]
+      register: existing_survey
+
+    - name: Extract existing defaults
+      ansible.builtin.set_fact:
+        old_defaults: >-
+          {{ dict((existing_survey.json.spec | default([])) | map(attribute='variable')
+             | zip((existing_survey.json.spec | default([])) | map(attribute='default', default=''))) }}
+      when: existing_survey.status == 200
+
+    - name: Resolve defaults (keep old if still valid, else first choice)
+      ansible.builtin.set_fact:
+        def_pair: "{{ pair_labels | select('equalto', old_defaults.gad_pair | default('')) | first | default(pair_labels | first) }}"
+        def_cluster: "{{ cluster_choices | select('equalto', old_defaults.esx_cluster | default('')) | first | default(cluster_choices | first) }}"
+        def_ppool: "{{ pool_choices | select('equalto', old_defaults.primary_pool | default('')) | first | default(pool_choices | first) }}"
+        def_spool: "{{ pool_choices | select('equalto', old_defaults.secondary_pool | default('')) | first | default(pool_choices | last) }}"
+
+    # ------------------------------------------------------------------
+    # Push survey
+    # ------------------------------------------------------------------
+    - name: Build survey spec
+      ansible.builtin.set_fact:
+        survey_spec:
+          name: ""
+          description: "Provision a GAD-protected VMFS datastore end to end"
+          spec:
+            - question_name: "GAD Pair (primary -> secondary)"
+              variable: "gad_pair"
+              type: "multiplechoice"
+              choices: "{{ pair_labels | join('\n') }}"
+              default: "{{ def_pair }}"
+              required: true
+              help_text: "P-VOL is created on the primary; S-VOL on the secondary."
+            - question_name: "ESX Cluster"
+              variable: "esx_cluster"
+              type: "multiplechoice"
+              choices: "{{ cluster_choices | join('\n') }}"
+              default: "{{ def_cluster }}"
+              required: true
+              help_text: "Only clusters with FC host groups on both arrays of a pair are listed. [..] shows which pair(s)."
+            - question_name: "Primary Pool"
+              variable: "primary_pool"
+              type: "multiplechoice"
+              choices: "{{ pool_choices | join('\n') }}"
+              default: "{{ def_ppool }}"
+              required: true
+              help_text: "Must be on the primary array of the chosen pair."
+            - question_name: "Secondary Pool"
+              variable: "secondary_pool"
+              type: "multiplechoice"
+              choices: "{{ pool_choices | join('\n') }}"
+              default: "{{ def_spool }}"
+              required: true
+              help_text: "Must be on the secondary array of the chosen pair."
+            - question_name: "Datastore Name"
+              variable: "datastore_name"
+              type: "text"
+              default: ""
+              required: true
+              min: 1
+              max: 32
+              help_text: "Also used as the LDEV name (both arrays) and GAD copy pair name."
+            - question_name: "Size (GB)"
+              variable: "size_gb"
+              type: "integer"
+              default: 1024
+              required: true
+              min: 10
+              max: 65536
+            - question_name: "Confirm (type CONFIRM to provision)"
+              variable: "confirm"
+              type: "text"
+              default: ""
+              required: false
+              help_text: >-
+                Leave blank for a plan-only run: discovers everything, prints
+                exactly what would be created, changes nothing. Re-launch with
+                CONFIRM to provision.
+
+    - name: Push survey spec
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/job_templates/{{ aap_job_template_id }}/survey_spec/"
+        method: POST
+        user: "{{ vault_aap_user }}"
+        password: "{{ vault_aap_pass }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs | default(false) }}"
+        body_format: json
+        body: "{{ survey_spec }}"
+        status_code: [200, 201]
+
+    - name: Ensure survey is enabled
+      ansible.builtin.uri:
+        url: "{{ aap_api_base }}/job_templates/{{ aap_job_template_id }}/"
+        method: PATCH
+        user: "{{ vault_aap_user }}"
+        password: "{{ vault_aap_pass }}"
+        force_basic_auth: true
+        validate_certs: "{{ aap_validate_certs | default(false) }}"
+        body_format: json
+        body:
+          survey_enabled: true
+        status_code: [200]

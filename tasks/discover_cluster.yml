@@ -1,0 +1,61 @@
+---
+# tasks/discover_cluster.yml
+# Input : cluster_name
+# Output: cluster_hosts (list of ESXi hostnames)
+#         cluster_wwpns (dict host -> [wwpn, ...], lowercase, no colons)
+#
+# The WWPNs are the join key between vCenter and the arrays: a host group
+# "belongs" to this cluster if any WWN registered in it is one of these.
+
+- name: "{{ cluster_name }} | Get cluster hosts"
+  community.vmware.vmware_cluster_info:
+    hostname: "{{ vc.hostname }}"
+    username: "{{ vc.username }}"
+    password: "{{ vc.password }}"
+    validate_certs: "{{ vc.validate_certs }}"
+    datacenter: "{{ vcenter_datacenter }}"
+    cluster_name: "{{ cluster_name }}"
+    schema: summary
+  register: cluster_info
+
+- name: "{{ cluster_name }} | Set host list"
+  ansible.builtin.set_fact:
+    cluster_hosts: "{{ cluster_info.clusters[cluster_name].hosts | map(attribute='name') | sort }}"
+
+- name: "{{ cluster_name }} | Fail if cluster has no hosts"
+  ansible.builtin.fail:
+    msg: "Cluster {{ cluster_name }} has no hosts."
+  when: cluster_hosts | length == 0
+
+- name: "{{ cluster_name }} | Get HBA details for every host"
+  community.vmware.vmware_host_vmhba_info:
+    hostname: "{{ vc.hostname }}"
+    username: "{{ vc.username }}"
+    password: "{{ vc.password }}"
+    validate_certs: "{{ vc.validate_certs }}"
+    cluster_name: "{{ cluster_name }}"
+  register: hba_info
+
+- name: "{{ cluster_name }} | Build host -> FC WWPN map"
+  ansible.builtin.set_fact:
+    cluster_wwpns: >-
+      {%- set out = {} -%}
+      {%- for h in cluster_hosts -%}
+        {%- set hbas = hba_info.hosts_vmhbas_info[h].vmhba_details | default([]) -%}
+        {%- set fc = hbas | selectattr('port_wwn', 'defined') | selectattr('port_wwn', 'string') | list -%}
+        {%- set wwpns = [] -%}
+        {%- for a in fc -%}
+          {%- set w = a.port_wwn | replace(':', '') | lower -%}
+          {%- if w | length == 16 -%}{%- set _ = wwpns.append(w) -%}{%- endif -%}
+        {%- endfor -%}
+        {%- set _ = out.update({h: wwpns | unique | list}) -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "{{ cluster_name }} | Fail if any host has no FC WWPNs"
+  ansible.builtin.fail:
+    msg: >-
+      Hosts with no FC WWPNs (iSCSI-only or HBA not visible to vCenter):
+      {{ cluster_wwpns | dict2items | rejectattr('value') | map(attribute='key') | list }}.
+      This project only handles FC host groups.
+  when: cluster_wwpns | dict2items | rejectattr('value') | list | length > 0

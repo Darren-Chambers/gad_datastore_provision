@@ -1,0 +1,17 @@
+---
+# tasks/fetch_array_hostgroups.yml
+# Input : array (dict: serial, connection_info), role (label only)
+# Output: hg_cache[array.serial] = list of host groups incl. WWNs and LUN paths
+# Read-only. Called once per array; matching is done from the cache.
+
+- name: "{{ role }} {{ array.serial }} | Get all host groups with WWNs and LUN paths"
+  hitachivantara.vspone_block.vsp.hv_hg_facts:
+    connection_info: "{{ array.connection_info }}"
+    spec:
+      query: [wwns, ldevs]
+  register: hg_facts
+  no_log: true
+
+- name: "{{ role }} {{ array.serial }} | Cache host groups"
+  ansible.builtin.set_fact:
+    hg_cache: "{{ hg_cache | default({}) | combine({array.serial: hg_facts.ansible_facts.hostGroups | default([])}) }}"

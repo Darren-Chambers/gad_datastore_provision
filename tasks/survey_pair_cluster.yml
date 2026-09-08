@@ -1,0 +1,50 @@
+---
+# tasks/survey_pair_cluster.yml  (survey refresh only)
+# Input : pair, cluster_name, all_cluster_hosts, all_cluster_wwpns, hg_cache
+# Output: capable_pairs_by_cluster[cluster_name] (+= pair.label if capable)
+#         cluster_capability_notes[cluster_name] (why not, if not)
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Match on primary"
+  ansible.builtin.include_tasks: tasks/match_hostgroups.yml
+  vars:
+    array: "{{ pair.primary }}"
+    role: primary
+    cluster_hosts: "{{ all_cluster_hosts[cluster_name] }}"
+    cluster_wwpns: "{{ all_cluster_wwpns[cluster_name] }}"
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Keep primary result"
+  ansible.builtin.set_fact:
+    p_hgs: "{{ matched_hgs }}"
+    p_missing: "{{ hg_missing_hosts }}"
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Match on secondary"
+  ansible.builtin.include_tasks: tasks/match_hostgroups.yml
+  vars:
+    array: "{{ pair.secondary }}"
+    role: secondary
+    cluster_hosts: "{{ all_cluster_hosts[cluster_name] }}"
+    cluster_wwpns: "{{ all_cluster_wwpns[cluster_name] }}"
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Keep secondary result"
+  ansible.builtin.set_fact:
+    s_hgs: "{{ matched_hgs }}"
+    s_missing: "{{ hg_missing_hosts }}"
+    s_meta: "{{ matched_hgs | selectattr('resource_group_id', 'equalto', 0) | map(attribute='name') | list }}"
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Record capability"
+  ansible.builtin.set_fact:
+    capable_pairs_by_cluster: >-
+      {{ capable_pairs_by_cluster | default({})
+         | combine({cluster_name: (capable_pairs_by_cluster | default({}))[cluster_name] | default([]) + [pair.label]}) }}
+  when: p_missing | length == 0 and s_missing | length == 0 and s_meta | length == 0
+
+- name: "{{ pair.label }} / {{ cluster_name }} | Record why not"
+  ansible.builtin.set_fact:
+    cluster_capability_notes: >-
+      {{ cluster_capability_notes | default({})
+         | combine({cluster_name: (cluster_capability_notes | default({}))[cluster_name] | default('')
+                    ~ pair.label ~ ': '
+                    ~ ('no HG on primary for ' ~ (p_missing | join(',')) ~ '; ' if p_missing else '')
+                    ~ ('no HG on secondary for ' ~ (s_missing | join(',')) ~ '; ' if s_missing else '')
+                    ~ ('secondary HGs in meta RG (need VSM): ' ~ (s_meta | join(',')) ~ '; ' if s_meta else '')}) }}
+  when: not (p_missing | length == 0 and s_missing | length == 0 and s_meta | length == 0)

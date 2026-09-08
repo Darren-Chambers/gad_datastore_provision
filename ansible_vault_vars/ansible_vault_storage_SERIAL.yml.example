@@ -1,0 +1,20 @@
+---
+# One file per GAD pair, named after the PRIMARY serial:
+#   ansible_vault_vars/ansible_vault_storage_<primary_serial>.yml
+# The filename is what the survey refresh discovers - the primary serial
+# is parsed from it, and the secondary is whatever this file says.
+# Same layout as the Hitachi vspone_block example playbooks.
+#
+#   cp ansible_vault_vars/ansible_vault_storage_SERIAL.yml.example \
+#      ansible_vault_vars/ansible_vault_storage_840130.yml
+#   ansible-vault encrypt ansible_vault_vars/ansible_vault_storage_840130.yml
+
+storage_serial: 840130
+storage_address: "dc1-b28.example.local"
+vault_storage_username: "ansible"
+vault_storage_secret: "changeme"
+
+secondary_storage_serial: 840183
+secondary_storage_address: "dc2-b28.example.local"
+vault_secondary_storage_username: "ansible"
+vault_secondary_storage_secret: "changeme"

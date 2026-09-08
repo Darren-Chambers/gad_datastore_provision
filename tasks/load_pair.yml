@@ -1,0 +1,52 @@
+---
+# tasks/load_pair.yml
+# Input : pair_primary_serial (string/int)
+# Output: pair (dict) with primary/secondary serial, address, connection_info
+#
+# The pair definition is the vault file named after the primary serial:
+#   ansible_vault_vars/ansible_vault_storage_<primary_serial>.yml
+# Loaded into a namespaced dict so multiple pairs can be walked in one run.
+
+- name: "Pair {{ pair_primary_serial }} | Check vault file exists"
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/ansible_vault_vars/ansible_vault_storage_{{ pair_primary_serial }}.yml"
+  register: pair_vault_stat
+
+- name: "Pair {{ pair_primary_serial }} | Fail if vault file is missing"
+  ansible.builtin.fail:
+    msg: >-
+      No vault file for primary serial {{ pair_primary_serial }}:
+      expected ansible_vault_vars/ansible_vault_storage_{{ pair_primary_serial }}.yml
+  when: not pair_vault_stat.stat.exists
+
+- name: "Pair {{ pair_primary_serial }} | Load pair vault"
+  ansible.builtin.include_vars:
+    file: "{{ pair_vault_stat.stat.path }}"
+    name: pair_vars
+
+- name: "Pair {{ pair_primary_serial }} | Fail if filename and storage_serial disagree"
+  ansible.builtin.fail:
+    msg: >-
+      Vault file is named for serial {{ pair_primary_serial }} but declares
+      storage_serial {{ pair_vars.storage_serial }}. Fix the file or the name.
+  when: (pair_vars.storage_serial | string) != (pair_primary_serial | string)
+
+- name: "Pair {{ pair_primary_serial }} | Build pair fact"
+  ansible.builtin.set_fact:
+    pair:
+      primary:
+        serial: "{{ pair_vars.storage_serial | string }}"
+        address: "{{ pair_vars.storage_address }}"
+        connection_info:
+          address: "{{ pair_vars.storage_address }}"
+          username: "{{ pair_vars.vault_storage_username }}"
+          password: "{{ pair_vars.vault_storage_secret }}"
+      secondary:
+        serial: "{{ pair_vars.secondary_storage_serial | string }}"
+        address: "{{ pair_vars.secondary_storage_address }}"
+        connection_info:
+          address: "{{ pair_vars.secondary_storage_address }}"
+          username: "{{ pair_vars.vault_secondary_storage_username }}"
+          password: "{{ pair_vars.vault_secondary_storage_secret }}"
+      label: "{{ pair_vars.storage_serial }} -> {{ pair_vars.secondary_storage_serial }}"
+  no_log: true

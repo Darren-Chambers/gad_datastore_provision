@@ -1,0 +1,55 @@
+---
+# tasks/survey_pair.yml  (survey refresh only)
+# Input : pair_primary_serial, all_cluster_hosts, all_cluster_wwpns
+# Output: pair_labels (+=), pool_choices (+=), capable_pairs_by_cluster,
+#         cluster_capability_notes
+
+- name: "Pair {{ pair_primary_serial }} | Load"
+  ansible.builtin.include_tasks: tasks/load_pair.yml
+
+- name: "Pair {{ pair.label }} | Record label"
+  ansible.builtin.set_fact:
+    pair_labels: "{{ pair_labels | default([]) + [pair.label] }}"
+
+# --- pools ------------------------------------------------------------
+- name: "Pair {{ pair.label }} | Get pools on both arrays"
+  hitachivantara.vspone_block.vsp.hv_storagepool_facts:
+    connection_info: "{{ item.connection_info }}"
+  loop:
+    - "{{ pair.primary }}"
+    - "{{ pair.secondary }}"
+  loop_control:
+    label: "{{ item.serial }}"
+  register: pool_facts
+  no_log: true
+
+- name: "Pair {{ pair.label }} | Add pool choices"
+  ansible.builtin.set_fact:
+    pool_choices: >-
+      {%- set out = pool_choices | default([]) -%}
+      {%- for r in pool_facts.results -%}
+        {%- for p in r.ansible_facts.storage_pool | default([]) -%}
+          {%- set free_tib = ((p.available_volume_capacity_mb | default(0)) / 1048576) | round(1) -%}
+          {%- set _ = out.append(r.item.serial ~ ' | pool ' ~ p.pool_id ~ ' | ' ~ p.pool_name ~ ' | ' ~ free_tib ~ ' TiB free') -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {{ out | unique | sort }}
+
+# --- host groups ------------------------------------------------------
+- name: "Pair {{ pair.label }} | Fetch host groups from both arrays"
+  ansible.builtin.include_tasks: tasks/fetch_array_hostgroups.yml
+  loop:
+    - { array: "{{ pair.primary }}", role: primary }
+    - { array: "{{ pair.secondary }}", role: secondary }
+  loop_control:
+    loop_var: side
+    label: "{{ side.role }}"
+  vars:
+    array: "{{ side.array }}"
+    role: "{{ side.role }}"
+
+- name: "Pair {{ pair.label }} | Test each cluster for full coverage on both arrays"
+  ansible.builtin.include_tasks: tasks/survey_pair_cluster.yml
+  loop: "{{ all_cluster_hosts | default({}) | list | sort }}"
+  loop_control:
+    loop_var: cluster_name

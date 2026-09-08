@@ -1,0 +1,5 @@
+vars/site_config.yml
+ansible_vault_vars/ansible_vault.yml
+ansible_vault_vars/ansible_vault_storage_*.yml
+!ansible_vault_vars/*.example
+*.retry

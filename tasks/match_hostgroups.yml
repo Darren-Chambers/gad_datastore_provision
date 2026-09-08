@@ -1,0 +1,38 @@
+---
+# tasks/match_hostgroups.yml
+# Input : array (dict: serial), role (label only)
+#         cluster_name, cluster_hosts, cluster_wwpns (from discover_cluster.yml)
+#         hg_cache[array.serial]          (from fetch_array_hostgroups.yml)
+# Output: matched_hgs      list of {port_id, name, host_group_number,
+#                                   resource_group_id, hosts, used_luns}
+#         hg_missing_hosts cluster hosts with no host group on this array
+#
+# A host group belongs to the cluster if any WWN registered in it is a
+# WWPN of a host in the cluster. Pure data - no array calls.
+
+- name: "{{ role }} {{ array.serial }} | Match host groups to cluster {{ cluster_name }} by WWN"
+  ansible.builtin.set_fact:
+    matched_hgs: >-
+      {%- set out = [] -%}
+      {%- for hg in hg_cache[array.serial] | default([]) -%}
+        {%- set hg_wwns = hg.wwns | default([]) | map(attribute='id') | map('lower') | list -%}
+        {%- set hosts = [] -%}
+        {%- for h, wwpns in cluster_wwpns.items() -%}
+          {%- if (wwpns | intersect(hg_wwns)) | length > 0 -%}{%- set _ = hosts.append(h) -%}{%- endif -%}
+        {%- endfor -%}
+        {%- if hosts | length > 0 -%}
+          {%- set _ = out.append({
+                'port_id': hg.port_id,
+                'name': hg.host_group_name,
+                'host_group_number': hg.host_group_id,
+                'resource_group_id': hg.resource_group_id | default(0),
+                'hosts': hosts | sort,
+                'used_luns': hg.lun_paths | default([]) | map(attribute='lun') | list
+              }) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{ out }}
+
+- name: "{{ role }} {{ array.serial }} | Work out which cluster hosts have no host group here"
+  ansible.builtin.set_fact:
+    hg_missing_hosts: "{{ cluster_hosts | difference(matched_hgs | map(attribute='hosts') | flatten | unique) }}"

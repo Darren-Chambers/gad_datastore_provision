@@ -1,0 +1,22 @@
+---
+# tasks/survey_cluster.yml  (survey refresh only)
+# Input : cluster_name
+# Output: all_cluster_hosts[cluster_name], all_cluster_wwpns[cluster_name]
+# Wraps discover_cluster.yml so a cluster with no FC hosts is skipped with
+# a note instead of failing the whole refresh.
+
+- name: "{{ cluster_name }} | Discover hosts and WWPNs"
+  block:
+    - name: "{{ cluster_name }} | Discover"
+      ansible.builtin.include_tasks: tasks/discover_cluster.yml
+
+    - name: "{{ cluster_name }} | Cache"
+      ansible.builtin.set_fact:
+        all_cluster_hosts: "{{ all_cluster_hosts | default({}) | combine({cluster_name: cluster_hosts}) }}"
+        all_cluster_wwpns: "{{ all_cluster_wwpns | default({}) | combine({cluster_name: cluster_wwpns}) }}"
+  rescue:
+    - name: "{{ cluster_name }} | Note why it was skipped"
+      ansible.builtin.set_fact:
+        cluster_capability_notes: >-
+          {{ cluster_capability_notes | default({})
+             | combine({cluster_name: 'skipped: ' ~ (ansible_failed_result.msg | default('discovery failed'))}) }}
